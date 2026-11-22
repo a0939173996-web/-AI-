@@ -47,15 +47,32 @@ static const char *WIFI_PASS = "YOUR_WIFI_PASSWORD";
 
 > 若人體偵測／目標資訊無資料，請將 MR60BHA2 模組韌體升級到支援 Human Detection 的版本（見 [Seeed Wiki](https://wiki.seeedstudio.com/getting_started_with_mr60bha2_mmwave_kit/)）。
 
-## 區網收聽範例
+## 區網收聽／控制
 
 - **UDP**：訂閱本機廣播埠 `4210`（目的為區網 `x.x.x.255`）
-- **TCP**：連線至裝置 IP 埠 `4211`，每秒會收到一行 JSON
+- **TCP**：連線至裝置 IP 埠 `4211`，每秒會收到一行 JSON；同一連線可回寫夜燈指令
 
 ```bash
 # 範例：用 socat 聽 UDP
 socat - UDP-RECV:4210,reuseaddr
 ```
+
+### 夜燈控制指令（TCP 一行一筆）
+
+```json
+{"cmd":"light","mode":"manual","brightness":0.65,"color":"warm_orange"}
+{"cmd":"light","mode":"manual","brightness":0.5,"r":255,"g":220,"b":180}
+{"cmd":"light","mode":"auto"}
+```
+
+| 欄位 | 說明 |
+| --- | --- |
+| `mode` | `manual` 遠端覆寫；`auto` 回到雷達聯動 |
+| `brightness` | 0.0–1.0 |
+| `color` | `warm_orange`／`warm_white`／`soft_amber`／`off` |
+| `r,g,b` | 可選，直接指定 RGB |
+
+狀態 JSON 會附帶 `light_mode`、`brightness`、`color`、`rgb`。
 
 ## 可調參數
 
