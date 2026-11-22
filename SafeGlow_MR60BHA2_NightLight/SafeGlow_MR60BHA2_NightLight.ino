@@ -81,6 +81,8 @@ enum class SleepMotionState : uint8_t {
   Active,
 };
 
+enum class LightMode : uint8_t { Auto = 0, Manual };
+
 static SleepMotionState g_motionState = SleepMotionState::Absent;
 static bool g_humanPresent = false;
 static float g_breathRateBpm = 0.0f;
@@ -95,6 +97,16 @@ static uint32_t g_activeUntilMs = 0;
 static uint32_t g_lastBroadcastMs = 0;
 static uint32_t g_lastPresenceMs = 0;
 static uint32_t g_bootMs = 0;
+
+// 夜燈遠端控制（TCP 指令；預設 auto 跟隨雷達）
+static LightMode g_lightMode = LightMode::Auto;
+static float g_manualBrightness = 0.55f;  // 0..1
+static uint8_t g_manualR = WARM_ORANGE_R;
+static uint8_t g_manualG = WARM_ORANGE_G;
+static uint8_t g_manualB = WARM_ORANGE_B;
+static char g_manualColorName[24] = "warm_orange";
+static char g_tcpLineBuf[4][256];
+static size_t g_tcpLineLen[4] = {0, 0, 0, 0};
 
 // isHumanDetected() 為「有新幀才有效」的一次性讀取；用逾時推斷離場
 static const uint32_t PRESENCE_TIMEOUT_MS = 5000;
@@ -113,6 +125,157 @@ static const char *motionStateToString(SleepMotionState s) {
   }
 }
 
+static const char *lightModeToString(LightMode m) {
+  return (m == LightMode::Manual) ? "manual" : "auto";
+}
+
+static float clampf(float v, float lo, float hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static bool extractJsonString(const char *json, const char *key, char *out,
+                              size_t outLen) {
+  char pattern[48];
+  snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+  const char *p = strstr(json, pattern);
+  if (!p) return false;
+  p = strchr(p + strlen(pattern), ':');
+  if (!p) return false;
+  p++;
+  while (*p == ' ' || *p == '\t') p++;
+  if (*p != '"') return false;
+  p++;
+  size_t i = 0;
+  while (*p && *p != '"' && i + 1 < outLen) {
+    out[i++] = *p++;
+  }
+  out[i] = '\0';
+  return i > 0;
+}
+
+static bool extractJsonNumber(const char *json, const char *key, float *out) {
+  char pattern[48];
+  snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+  const char *p = strstr(json, pattern);
+  if (!p) return false;
+  p = strchr(p + strlen(pattern), ':');
+  if (!p) return false;
+  p++;
+  while (*p == ' ' || *p == '\t') p++;
+  char *end = nullptr;
+  const float v = strtof(p, &end);
+  if (end == p) return false;
+  *out = v;
+  return true;
+}
+
+static void applyNamedColor(const char *name) {
+  if (strcmp(name, "warm_white") == 0) {
+    g_manualR = WARM_WHITE_R;
+    g_manualG = WARM_WHITE_G;
+    g_manualB = WARM_WHITE_B;
+    strncpy(g_manualColorName, "warm_white", sizeof(g_manualColorName) - 1);
+  } else if (strcmp(name, "soft_amber") == 0) {
+    g_manualR = 255;
+    g_manualG = 191;
+    g_manualB = 105;
+    strncpy(g_manualColorName, "soft_amber", sizeof(g_manualColorName) - 1);
+  } else if (strcmp(name, "off") == 0) {
+    g_manualBrightness = 0.0f;
+    strncpy(g_manualColorName, "off", sizeof(g_manualColorName) - 1);
+  } else {
+    // 預設／warm_orange
+    g_manualR = WARM_ORANGE_R;
+    g_manualG = WARM_ORANGE_G;
+    g_manualB = WARM_ORANGE_B;
+    strncpy(g_manualColorName, "warm_orange", sizeof(g_manualColorName) - 1);
+  }
+  g_manualColorName[sizeof(g_manualColorName) - 1] = '\0';
+}
+
+static void handleControlCommand(const char *line) {
+  // 協定（一行一筆 JSON，區網 TCP）：
+  // {"cmd":"light","mode":"manual","brightness":0.65,"color":"warm_orange"}
+  // {"cmd":"light","mode":"manual","brightness":0.5,"r":255,"g":159,"b":67}
+  // {"cmd":"light","mode":"auto"}
+  char cmd[24] = {0};
+  if (!extractJsonString(line, "cmd", cmd, sizeof(cmd))) {
+    return;
+  }
+  if (strcmp(cmd, "light") != 0) {
+    return;
+  }
+
+  char mode[16] = {0};
+  if (extractJsonString(line, "mode", mode, sizeof(mode))) {
+    if (strcmp(mode, "auto") == 0) {
+      g_lightMode = LightMode::Auto;
+      Serial.println(F("[light] mode=auto"));
+      return;
+    }
+    if (strcmp(mode, "manual") == 0) {
+      g_lightMode = LightMode::Manual;
+    }
+  } else {
+    g_lightMode = LightMode::Manual;
+  }
+
+  float brightness = g_manualBrightness;
+  if (extractJsonNumber(line, "brightness", &brightness)) {
+    g_manualBrightness = clampf(brightness, 0.0f, 1.0f);
+  }
+
+  char color[24] = {0};
+  if (extractJsonString(line, "color", color, sizeof(color))) {
+    applyNamedColor(color);
+  }
+
+  float r = -1, g = -1, b = -1;
+  const bool hasR = extractJsonNumber(line, "r", &r);
+  const bool hasG = extractJsonNumber(line, "g", &g);
+  const bool hasB = extractJsonNumber(line, "b", &b);
+  if (hasR && hasG && hasB) {
+    g_manualR = static_cast<uint8_t>(constrain(lroundf(r), 0, 255));
+    g_manualG = static_cast<uint8_t>(constrain(lroundf(g), 0, 255));
+    g_manualB = static_cast<uint8_t>(constrain(lroundf(b), 0, 255));
+    snprintf(g_manualColorName, sizeof(g_manualColorName), "custom");
+  }
+
+  Serial.printf("[light] mode=manual brightness=%.2f rgb=(%u,%u,%u) color=%s\n",
+                g_manualBrightness, g_manualR, g_manualG, g_manualB,
+                g_manualColorName);
+}
+
+static void pollTcpCommands() {
+  for (size_t i = 0; i < (sizeof(tcpClients) / sizeof(tcpClients[0])); i++) {
+    if (!tcpClients[i] || !tcpClients[i].connected()) {
+      g_tcpLineLen[i] = 0;
+      continue;
+    }
+    while (tcpClients[i].available() > 0) {
+      const char c = static_cast<char>(tcpClients[i].read());
+      if (c == '\r') {
+        continue;
+      }
+      if (c == '\n') {
+        g_tcpLineBuf[i][g_tcpLineLen[i]] = '\0';
+        if (g_tcpLineLen[i] > 0) {
+          handleControlCommand(g_tcpLineBuf[i]);
+        }
+        g_tcpLineLen[i] = 0;
+        continue;
+      }
+      if (g_tcpLineLen[i] + 1 < sizeof(g_tcpLineBuf[i])) {
+        g_tcpLineBuf[i][g_tcpLineLen[i]++] = c;
+      } else {
+        g_tcpLineLen[i] = 0;  // 溢位：丟棄此行
+      }
+    }
+  }
+}
+
 static uint8_t scaleChannel(uint8_t base, float brightness) {
   if (brightness < 0.0f) brightness = 0.0f;
   if (brightness > 1.0f) brightness = 1.0f;
@@ -124,12 +287,6 @@ static void setPixelRgb(uint8_t r, uint8_t g, uint8_t b, float brightness) {
                                      scaleChannel(g, brightness),
                                      scaleChannel(b, brightness)));
   pixel.show();
-}
-
-static float clampf(float v, float lo, float hi) {
-  if (v < lo) return lo;
-  if (v > hi) return hi;
-  return v;
 }
 
 /**
@@ -214,13 +371,22 @@ static void buildStatusJson(char *buf, size_t buflen) {
            "{\"device_status\":\"%s\","
            "\"signal_quality_index\":%d,"
            "\"sleep_motion_state\":\"%s\","
-           "\"breathing_rate_bpm\":%.1f}",
+           "\"breathing_rate_bpm\":%.1f,"
+           "\"light_mode\":\"%s\","
+           "\"brightness\":%.2f,"
+           "\"color\":\"%s\","
+           "\"rgb\":[%u,%u,%u]}",
            deviceStatus, g_signalQuality, motionStateToString(g_motionState),
-           breathOut);
+           breathOut, lightModeToString(g_lightMode),
+           (g_lightMode == LightMode::Manual) ? g_manualBrightness : -1.0f,
+           (g_lightMode == LightMode::Manual) ? g_manualColorName : "auto",
+           (g_lightMode == LightMode::Manual) ? g_manualR : 0,
+           (g_lightMode == LightMode::Manual) ? g_manualG : 0,
+           (g_lightMode == LightMode::Manual) ? g_manualB : 0);
 }
 
 static void broadcastStatusJson() {
-  char json[192];
+  char json[320];
   buildStatusJson(json, sizeof(json));
 
   // 1) 序列埠
@@ -246,6 +412,17 @@ static void broadcastStatusJson() {
 
 static void updateNightLight() {
   const uint32_t now = millis();
+
+  // 遠端手動覆寫：亮度滑桿／顏色按鈕優先於雷達聯動
+  if (g_lightMode == LightMode::Manual) {
+    if (g_manualBrightness <= 0.001f || strcmp(g_manualColorName, "off") == 0) {
+      pixel.clear();
+      pixel.show();
+    } else {
+      setPixelRgb(g_manualR, g_manualG, g_manualB, g_manualBrightness);
+    }
+    return;
+  }
 
   if (g_motionState == SleepMotionState::Absent) {
     pixel.clear();
@@ -432,6 +609,7 @@ void loop() {
 
   if (WiFi.status() == WL_CONNECTED) {
     acceptTcpClients();
+    pollTcpCommands();
   }
 
   const uint32_t now = millis();
